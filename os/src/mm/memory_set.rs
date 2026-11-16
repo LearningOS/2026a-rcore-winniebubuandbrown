@@ -48,6 +48,57 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
+
+    /// Map an unused user address range.
+    pub fn mmap(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        if start % PAGE_SIZE != 0 || len == 0 || prot == 0 || prot & !7 != 0 {
+            return -1;
+        }
+        let end = match start.checked_add(len) {
+            Some(end) if end <= (1usize << 38) => end,
+            _ => return -1,
+        };
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(end);
+        for vpn in VPNRange::new(start_va.floor(), end_va.ceil()) {
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if pte.is_valid() {
+                    return -1;
+                }
+            }
+        }
+        let perm = MapPermission::from_bits((prot << 1) as u8).unwrap()
+            | MapPermission::U;
+        self.insert_framed_area(start_va, end_va, perm);
+        0
+    }
+
+    /// Unmap one complete user framed area.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        if start % PAGE_SIZE != 0 || len == 0 {
+            return -1;
+        }
+        let end = match start.checked_add(len) {
+            Some(end) if end <= (1usize << 38) => end,
+            _ => return -1,
+        };
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(end).ceil();
+        let index = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn
+                && area.vpn_range.get_end() == end_vpn
+                && area.map_type == MapType::Framed
+                && area.map_perm.contains(MapPermission::U)
+        });
+        if let Some(index) = index {
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
+            0
+        } else {
+            -1
+        }
+    }
+
     /// Assume that no conflicts.
     pub fn insert_framed_area(
         &mut self,
