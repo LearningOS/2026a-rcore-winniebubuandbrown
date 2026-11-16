@@ -52,12 +52,57 @@ impl Inode {
                 disk_inode.read_at(DIRENT_SZ * i, dirent.as_bytes_mut(), &self.block_device,),
                 DIRENT_SZ,
             );
-            if dirent.name() == name {
+            //if dirent.name() == name {
+            if !dirent.name().is_empty() && dirent.name() == name {
                 return Some(dirent.inode_id() as u32);
             }
         }
         None
     }
+
+    /// Get the inode number within this filesystem.
+    pub fn inode_id(&self) -> u32 {
+        let fs = self.fs.lock();
+        let (first_block, _) = fs.get_disk_inode_pos(0);
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = super::BLOCK_SZ / inode_size;
+        (self.block_id - first_block as usize) as u32
+            * inodes_per_block as u32
+            + (self.block_offset / inode_size) as u32
+    }
+
+    /// Check whether this inode represents a directory.
+    pub fn is_dir(&self) -> bool {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|inode| inode.is_dir())
+    }
+
+    /// Count directory entries referring to the given inode.
+    pub fn link_count(&self, inode_id: u32) -> u32 {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|directory| {
+            assert!(directory.is_dir());
+            let mut count = 0;
+            let mut entry = DirEntry::empty();
+            for i in 0..directory.size as usize / DIRENT_SZ {
+                assert_eq!(
+                    directory.read_at(
+                        i * DIRENT_SZ,
+                        entry.as_bytes_mut(),
+                        &self.block_device,
+                    ),
+                    DIRENT_SZ,
+                );
+                if !entry.name().is_empty()
+                    && entry.inode_id() == inode_id
+                {
+                    count += 1;
+                }
+            }
+            count
+        })
+    }
+
     /// Find inode under current inode by name
     pub fn find(&self, name: &str) -> Option<Arc<Inode>> {
         let fs = self.fs.lock();
@@ -73,6 +118,59 @@ impl Inode {
             })
         })
     }
+
+    /// Create another directory entry for an existing file.
+    pub fn link(&self, old_name: &str, new_name: &str) -> bool {
+        if [old_name, new_name].iter().any(|name|
+            name.is_empty() || name.len() > 27 || name.contains('/'))
+        {
+            return false;
+        }
+        let mut fs = self.fs.lock();
+        let source = self.read_disk_inode(|dir| {
+            if self.find_inode_id(new_name, dir).is_some() {
+                None
+            } else {
+                self.find_inode_id(old_name, dir)
+            }
+        });
+        let inode_id = match source {
+            Some(id) => id,
+            None => return false,
+        };
+        self.modify_disk_inode(|dir| {
+            let offset = dir.size as usize;
+            self.increase_size((offset + DIRENT_SZ) as u32, dir, &mut fs);
+            let entry = DirEntry::new(new_name, inode_id);
+            assert_eq!(dir.write_at(offset, entry.as_bytes(), &self.block_device), DIRENT_SZ);
+        });
+        block_cache_sync_all();
+        true
+    }
+
+    /// Remove a directory entry while preserving open file contents.
+    pub fn unlink(&self, name: &str) -> bool {
+        if name.is_empty() || name.len() > 27 || name.contains('/') {
+            return false;
+        }
+        let _fs = self.fs.lock();
+        let removed = self.modify_disk_inode(|dir| {
+            assert!(dir.is_dir());
+            let mut entry = DirEntry::empty();
+            for i in 0..dir.size as usize / DIRENT_SZ {
+                dir.read_at(i * DIRENT_SZ, entry.as_bytes_mut(), &self.block_device);
+                if entry.name() == name {
+                    let empty = DirEntry::empty();
+                    assert_eq!(dir.write_at(i * DIRENT_SZ, empty.as_bytes(), &self.block_device), DIRENT_SZ);
+                    return true;
+                }
+            }
+            false
+        });
+        block_cache_sync_all();
+        removed
+    }
+
     /// Increase the size of a disk inode
     fn increase_size(
         &self,
@@ -150,7 +248,10 @@ impl Inode {
                     disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device,),
                     DIRENT_SZ,
                 );
-                v.push(String::from(dirent.name()));
+                //v.push(String::from(dirent.name()));
+                if !dirent.name().is_empty() {
+                    v.push(String::from(dirent.name()));
+                }
             }
             v
         })
