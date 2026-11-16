@@ -70,6 +70,38 @@ impl MemorySet {
         }
         self.areas.push(map_area);
     }
+
+    /// Insert a user framed mapping if the range is unused.
+    pub fn insert_framed_area_checked(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        if start_vpn.0 >= end_vpn.0 {
+            return false;
+        }
+
+        //for vpn in VPNRange::new(start_vpn, end_vpn) {
+          //  if self.page_table.translate(vpn).is_some() {
+             //   return false;
+           // }
+        //}
+        for vpn in VPNRange::new(start_vpn, end_vpn) {
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if pte.is_valid() {
+                    return false;
+                }
+            }
+        }
+
+        self.insert_framed_area(start_va, end_va, permission);
+        true
+    }
+
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
         self.page_table.map(
@@ -257,6 +289,24 @@ impl MemorySet {
             .find(|area| area.vpn_range.get_start() == start.floor())
         {
             area.append_to(&mut self.page_table, new_end.ceil());
+            true
+        } else {
+            false
+        }
+    }
+        /// Remove one complete user framed mapping.
+    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        if let Some(index) = self.areas.iter().position(|area| {
+            area.vpn_range.get_start() == start_vpn
+                && area.vpn_range.get_end() == end_vpn
+                && area.map_type == MapType::Framed
+                && area.map_perm.contains(MapPermission::U)
+        }) {
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
             true
         } else {
             false

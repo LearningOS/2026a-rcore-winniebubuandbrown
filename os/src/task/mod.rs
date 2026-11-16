@@ -17,6 +17,7 @@ mod task;
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
+use crate::mm::{MapPermission, VirtAddr};
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -44,6 +45,8 @@ pub struct TaskManager {
 struct TaskManagerInner {
     /// task list
     tasks: Vec<TaskControlBlock>,
+     /// 每个任务的系统调用次数
+    syscall_times: Vec<[usize; 512]>, 
     /// id of current `Running` task
     current_task: usize,
 }
@@ -58,11 +61,17 @@ lazy_static! {
         for i in 0..num_app {
             tasks.push(TaskControlBlock::new(get_app_data(i), i));
         }
+        let mut syscall_times: Vec<[usize; 512]> = Vec::new();
+            
+        for _ in 0..num_app {
+            syscall_times.push([0; 512]);
+        }
         TaskManager {
             num_app,
             inner: unsafe {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
+                    syscall_times,
                     current_task: 0,
                 })
             },
@@ -120,6 +129,26 @@ impl TaskManager {
         inner.tasks[inner.current_task].get_user_token()
     }
 
+    fn record_syscall(&self, syscall_id: usize) {
+        if syscall_id >= 512 {
+            return;
+        }
+
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.syscall_times[current][syscall_id] += 1;
+    }
+
+    fn get_current_syscall_count(&self, syscall_id: usize) -> usize {
+        if syscall_id >= 512 {
+            return 0;
+        }
+
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.syscall_times[current][syscall_id]
+    }
+
     /// Get the current 'Running' task's trap contexts.
     fn get_current_trap_cx(&self) -> &'static mut TrapContext {
         let inner = self.inner.exclusive_access();
@@ -131,6 +160,27 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].change_program_brk(size)
+    }
+
+        fn mmap_current(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current]
+            .memory_set
+            .insert_framed_area_checked(start, end, permission)
+    }
+
+    fn munmap_current(&self, start: VirtAddr, end: VirtAddr) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current]
+            .memory_set
+            .remove_framed_area(start, end)
     }
 
     /// Switch current `Running` task to the task we have found,
@@ -193,6 +243,16 @@ pub fn current_user_token() -> usize {
     TASK_MANAGER.get_current_token()
 }
 
+/// Record one system call for the current task.
+pub fn record_syscall(syscall_id: usize) {
+    TASK_MANAGER.record_syscall(syscall_id);
+}
+
+/// Get the current task's count for a system call.
+pub fn current_syscall_count(syscall_id: usize) -> usize {
+    TASK_MANAGER.get_current_syscall_count(syscall_id)
+}
+
 /// Get the current 'Running' task's trap contexts.
 pub fn current_trap_cx() -> &'static mut TrapContext {
     TASK_MANAGER.get_current_trap_cx()
@@ -201,4 +261,14 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Map framed pages in the current task.
+pub fn mmap_current(start: VirtAddr, end: VirtAddr, permission: MapPermission) -> bool {
+    TASK_MANAGER.mmap_current(start, end, permission)
+}
+
+/// Unmap framed pages in the current task.
+pub fn munmap_current(start: VirtAddr, end: VirtAddr) -> bool {
+    TASK_MANAGER.munmap_current(start, end)
 }
