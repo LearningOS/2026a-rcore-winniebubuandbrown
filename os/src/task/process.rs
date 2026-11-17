@@ -23,6 +23,51 @@ pub struct ProcessControlBlock {
     inner: UPSafeCell<ProcessControlBlockInner>,
 }
 
+
+/// Resource allocation and outstanding requests for deadlock detection.
+pub struct DeadlockResource {
+    /// Total number of resource units.
+    pub capacity: usize,
+    /// Units held by each thread, indexed by tid.
+    pub allocation: Vec<usize>,
+    /// Pending requests from each thread, indexed by tid.
+    pub request: Vec<usize>,
+}
+
+impl DeadlockResource {
+    /// Create a resource record.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            allocation: Vec::new(),
+            request: Vec::new(),
+        }
+    }
+
+    fn ensure_tid(&mut self, tid: usize) {
+        if self.allocation.len() <= tid {
+            self.allocation.resize(tid + 1, 0);
+            self.request.resize(tid + 1, 0);
+        }
+    }
+
+    pub fn set_request(&mut self, tid: usize, amount: usize) {
+        self.ensure_tid(tid);
+        self.request[tid] = amount;
+    }
+
+    pub fn acquire(&mut self, tid: usize, amount: usize) {
+        self.ensure_tid(tid);
+        self.request[tid] = 0;
+        self.allocation[tid] += amount;
+    }
+
+    pub fn release(&mut self, tid: usize, amount: usize) {
+        self.ensure_tid(tid);
+        self.allocation[tid] = self.allocation[tid].saturating_sub(amount);
+    }
+}
+
 /// Inner of Process Control Block
 pub struct ProcessControlBlockInner {
     /// is zombie?
@@ -49,6 +94,15 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+
+        /// Whether deadlock detection is enabled.
+    pub deadlock_detect: bool,
+    /// Resource records used by deadlock detection.
+    pub deadlock_resources: Vec<DeadlockResource>,
+    /// Resource record index for each mutex.
+    pub mutex_resource_ids: Vec<usize>,
+    /// Resource record index for each semaphore.
+    pub semaphore_resource_ids: Vec<usize>,
 }
 
 impl ProcessControlBlockInner {
@@ -82,6 +136,120 @@ impl ProcessControlBlockInner {
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
     }
+
+        /// Register a mutex or semaphore for deadlock detection.
+    pub fn register_deadlock_resource(&mut self, capacity: usize) -> usize {
+        let id = self.deadlock_resources.len();
+        self.deadlock_resources
+            .push(DeadlockResource::new(capacity));
+        id
+    }
+
+    /// Record a pending request and return false if it would deadlock.
+    pub fn request_deadlock_resource(&mut self, tid: usize, id: usize) -> bool {
+        if id >= self.deadlock_resources.len() {
+            return false;
+        }
+
+        self.deadlock_resources[id].ensure_tid(tid);
+        self.deadlock_resources[id].request[tid] += 1;
+
+        //if self.has_deadlock() {
+        if self.deadlock_detect && self.has_deadlock() {
+            self.deadlock_resources[id].request[tid] -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Move one resource unit from pending request to allocation.
+    pub fn acquire_deadlock_resource(&mut self, tid: usize, id: usize) {
+        if let Some(resource) = self.deadlock_resources.get_mut(id) {
+            resource.ensure_tid(tid);
+            if resource.request[tid] > 0 {
+                resource.request[tid] -= 1;
+            }
+            resource.allocation[tid] += 1;
+        }
+    }
+
+    /// Release one resource unit.
+    pub fn release_deadlock_resource(&mut self, tid: usize, id: usize) {
+        if let Some(resource) = self.deadlock_resources.get_mut(id) {
+            resource.ensure_tid(tid);
+            if resource.allocation[tid] > 0 {
+                resource.allocation[tid] -= 1;
+            } else if let Some(owner) =
+                resource.allocation.iter_mut().find(|count| **count > 0)
+            {
+                *owner -= 1;
+            } else {
+                // Semaphores may also be used to signal another thread.
+                resource.capacity += 1;
+            }
+        }
+    }
+
+    fn has_deadlock(&self) -> bool {
+        let thread_count = self
+            .deadlock_resources
+            .iter()
+            .map(|resource| resource.allocation.len().max(resource.request.len()))
+            .max()
+            .unwrap_or(0);
+
+        let mut work: Vec<usize> = self
+            .deadlock_resources
+            .iter()
+            .map(|resource| {
+                let allocated: usize = resource.allocation.iter().sum();
+                resource.capacity.saturating_sub(allocated)
+            })
+            .collect();
+
+        let mut finish = vec![true; thread_count];
+        for tid in 0..thread_count {
+            for resource in &self.deadlock_resources {
+                let allocated = resource.allocation.get(tid).copied().unwrap_or(0);
+                let requested = resource.request.get(tid).copied().unwrap_or(0);
+                if allocated != 0 || requested != 0 {
+                    finish[tid] = false;
+                    break;
+                }
+            }
+        }
+
+        loop {
+            let mut progressed = false;
+            for tid in 0..thread_count {
+                if finish[tid] {
+                    continue;
+                }
+
+                let can_finish = self
+                    .deadlock_resources
+                    .iter()
+                    .enumerate()
+                    .all(|(id, resource)| {
+                        resource.request.get(tid).copied().unwrap_or(0) <= work[id]
+                    });
+
+                if can_finish {
+                    for (id, resource) in self.deadlock_resources.iter().enumerate() {
+                        work[id] += resource.allocation.get(tid).copied().unwrap_or(0);
+                    }
+                    finish[tid] = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        finish.iter().any(|finished| !finished)
+    }
 }
 
 impl ProcessControlBlock {
@@ -104,6 +272,10 @@ impl ProcessControlBlock {
                     memory_set,
                     parent: None,
                     children: Vec::new(),
+                    deadlock_detect: false,
+                    deadlock_resources: Vec::new(),
+                    mutex_resource_ids: Vec::new(),
+                    semaphore_resource_ids: Vec::new(),
                     exit_code: 0,
                     fd_table: vec![
                         // 0 -> stdin
@@ -234,6 +406,10 @@ impl ProcessControlBlock {
             inner: unsafe {
                 UPSafeCell::new(ProcessControlBlockInner {
                     is_zombie: false,
+                    deadlock_detect: false,
+                    deadlock_resources: Vec::new(),
+                    mutex_resource_ids: Vec::new(),
+                    semaphore_resource_ids: Vec::new(),
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),

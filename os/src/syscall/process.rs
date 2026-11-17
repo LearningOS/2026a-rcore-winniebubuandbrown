@@ -151,12 +151,42 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/*pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
         "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
     -1
+}*/
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let time_ms = crate::timer::get_time_ms();
+    let value = TimeVal {
+        sec: time_ms / 1000,
+        usec: (time_ms % 1000) * 1000,
+    };
+
+    let process = current_process();
+    let token = process.inner_exclusive_access().get_user_token();
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &value as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+
+    let mut offset = 0;
+    for buffer in crate::mm::translated_byte_buffer(
+        token,
+        ts as *const u8,
+        bytes.len(),
+    ) {
+        let end = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..end]);
+        offset = end;
+    }
+
+    0
 }
 
 /// mmap syscall
